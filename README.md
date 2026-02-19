@@ -40,6 +40,34 @@ pg-health check -c "..." -o report.json
 pg-health serve --port 8767
 ```
 
+## API Usage
+
+```bash
+# JSON API (AI-friendly)
+curl -X POST https://pg.indiekit.ai/api/check \
+  -H "Content-Type: application/json" \
+  -d '{"connection_string": "postgresql://user:pass@host:5432/db"}'
+```
+
+Response:
+```json
+{
+  "ok": true,
+  "report": {
+    "database_name": "mydb",
+    "checks": [
+      {"name": "Cache Hit Ratio", "severity": "ok", "message": "..."},
+      ...
+    ],
+    "unused_indexes": [...],
+    "tables": [...],
+    "slow_queries": [...]
+  }
+}
+```
+
+Note: Special characters in password (like `@`) are auto-encoded.
+
 ## Environment Variables
 
 ```bash
