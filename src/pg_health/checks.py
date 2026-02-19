@@ -269,8 +269,13 @@ async def run_health_check(connection_string: str) -> HealthReport:
         unused = await conn.fetch(QUERIES["unused_indexes"])
         stats_reset = await conn.fetchval(QUERIES["stats_reset"])
         stats_note = ""
+        from datetime import datetime, timezone
+        
+        # If stats_reset is NULL, use postmaster start time
+        if not stats_reset:
+            stats_reset = await conn.fetchval("SELECT pg_postmaster_start_time();")
+        
         if stats_reset:
-            from datetime import datetime, timezone
             days_since_reset = (datetime.now(timezone.utc) - stats_reset).days
             if days_since_reset < 7:
                 stats_note = f" (stats only {days_since_reset}d old - may be inaccurate)"
@@ -283,7 +288,7 @@ async def run_health_check(connection_string: str) -> HealthReport:
                 description="Indexes that have never been scanned",
                 severity=Severity.WARNING if len(unused) > 5 else Severity.INFO,
                 message=f"{len(unused)} unused indexes found{stats_note}",
-                suggestion="Consider dropping unused indexes to save space and improve write performance",
+                suggestion="Review before dropping — small tables may use seq scan instead of index scan",
             ))
             for row in unused:
                 report.unused_indexes.append(IndexInfo(
