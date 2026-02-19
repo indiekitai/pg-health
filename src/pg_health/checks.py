@@ -1,5 +1,7 @@
 """PostgreSQL health check queries and logic."""
 
+import re
+from urllib.parse import quote, urlparse, urlunparse
 import asyncpg
 from .models import (
     CheckResult,
@@ -147,8 +149,33 @@ QUERIES = {
 }
 
 
+def fix_connection_string(connection_string: str) -> str:
+    """Fix special characters in password that need URL encoding.
+    
+    Handles cases like: postgresql://user:pass@word@host/db
+    where the password contains @ or other special chars.
+    """
+    # Match postgresql://user:password@host:port/database
+    # The trick: find the LAST @ before the host (which doesn't contain @)
+    match = re.match(
+        r'^(postgresql://|postgres://)([^:]+):(.+)@([^@/]+)(/.*)$',
+        connection_string
+    )
+    if match:
+        scheme, user, password, host, path = match.groups()
+        # URL-encode the password
+        encoded_password = quote(password, safe='')
+        return f"{scheme}{user}:{encoded_password}@{host}{path}"
+    
+    # If pattern doesn't match, return as-is
+    return connection_string
+
+
 async def run_health_check(connection_string: str) -> HealthReport:
     """Run all health checks and return a report."""
+    
+    # Fix special characters in password
+    connection_string = fix_connection_string(connection_string)
     
     conn = await asyncpg.connect(connection_string)
     
