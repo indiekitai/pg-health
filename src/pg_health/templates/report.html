@@ -1,0 +1,230 @@
+{% set severity_colors = {
+    Severity.OK: '#3fb950',
+    Severity.INFO: '#58a6ff',
+    Severity.WARNING: '#d29922',
+    Severity.CRITICAL: '#f85149'
+} %}
+{% set severity_icons = {
+    Severity.OK: '✅',
+    Severity.INFO: 'ℹ️',
+    Severity.WARNING: '⚠️',
+    Severity.CRITICAL: '❌'
+} %}
+
+<style>
+    .report-card {
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 10px;
+        padding: 20px;
+        margin-bottom: 15px;
+    }
+    .report-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 20px;
+        padding-bottom: 15px;
+        border-bottom: 1px solid #30363d;
+    }
+    .db-name {
+        font-size: 24px;
+        font-weight: bold;
+        color: #58a6ff;
+    }
+    .db-version {
+        color: #8b949e;
+        font-size: 14px;
+    }
+    .summary-badges {
+        display: flex;
+        gap: 10px;
+    }
+    .badge {
+        padding: 4px 12px;
+        border-radius: 20px;
+        font-size: 13px;
+        font-weight: 500;
+    }
+    .check-item {
+        display: flex;
+        align-items: flex-start;
+        padding: 12px 0;
+        border-bottom: 1px solid #21262d;
+    }
+    .check-item:last-child {
+        border-bottom: none;
+    }
+    .check-icon {
+        font-size: 18px;
+        margin-right: 12px;
+        min-width: 24px;
+    }
+    .check-content {
+        flex: 1;
+    }
+    .check-name {
+        font-weight: 500;
+        margin-bottom: 4px;
+    }
+    .check-message {
+        font-size: 14px;
+    }
+    .check-suggestion {
+        font-size: 13px;
+        color: #8b949e;
+        margin-top: 4px;
+        font-style: italic;
+    }
+    .section-title {
+        font-size: 18px;
+        font-weight: 600;
+        margin: 25px 0 15px 0;
+        color: #c9d1d9;
+    }
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+    }
+    th {
+        text-align: left;
+        padding: 10px;
+        background: #21262d;
+        color: #8b949e;
+        font-weight: 500;
+    }
+    td {
+        padding: 10px;
+        border-bottom: 1px solid #21262d;
+    }
+    .mono {
+        font-family: monospace;
+        font-size: 13px;
+    }
+    .query-text {
+        background: #0d1117;
+        padding: 8px;
+        border-radius: 4px;
+        font-family: monospace;
+        font-size: 12px;
+        color: #8b949e;
+        word-break: break-all;
+    }
+</style>
+
+<div class="report-card">
+    <div class="report-header">
+        <div>
+            <div class="db-name">{{ report.database_name }}</div>
+            <div class="db-version">{{ report.database_version }}</div>
+        </div>
+        <div class="summary-badges">
+            {% if report.summary[Severity.CRITICAL] > 0 %}
+            <span class="badge" style="background: rgba(248, 81, 73, 0.2); color: #f85149;">
+                {{ report.summary[Severity.CRITICAL] }} Critical
+            </span>
+            {% endif %}
+            {% if report.summary[Severity.WARNING] > 0 %}
+            <span class="badge" style="background: rgba(210, 153, 34, 0.2); color: #d29922;">
+                {{ report.summary[Severity.WARNING] }} Warnings
+            </span>
+            {% endif %}
+            <span class="badge" style="background: rgba(63, 185, 80, 0.2); color: #3fb950;">
+                {{ report.summary[Severity.OK] }} OK
+            </span>
+        </div>
+    </div>
+
+    <h3 class="section-title">Health Checks</h3>
+    {% for check in report.checks %}
+    <div class="check-item">
+        <span class="check-icon">{{ severity_icons[check.severity] }}</span>
+        <div class="check-content">
+            <div class="check-name">{{ check.name }}</div>
+            <div class="check-message" style="color: {{ severity_colors[check.severity] }};">
+                {{ check.message }}
+            </div>
+            {% if check.suggestion %}
+            <div class="check-suggestion">💡 {{ check.suggestion }}</div>
+            {% endif %}
+        </div>
+    </div>
+    {% endfor %}
+</div>
+
+{% if report.tables %}
+<div class="report-card">
+    <h3 class="section-title" style="margin-top: 0;">Largest Tables</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Table</th>
+                <th>Rows</th>
+                <th>Total Size</th>
+                <th>Index Size</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for t in report.tables[:10] %}
+            <tr>
+                <td class="mono">{{ t.schema_name }}.{{ t.table_name }}</td>
+                <td>{{ '{:,}'.format(t.row_count) }}</td>
+                <td>{{ t.total_size }}</td>
+                <td>{{ t.index_size }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+{% if report.unused_indexes %}
+<div class="report-card">
+    <h3 class="section-title" style="margin-top: 0;">⚠️ Unused Indexes</h3>
+    <p style="color: #8b949e; font-size: 14px; margin-bottom: 15px;">
+        These indexes have never been used and may be candidates for removal.
+    </p>
+    <table>
+        <thead>
+            <tr>
+                <th>Index</th>
+                <th>Table</th>
+                <th>Size</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for idx in report.unused_indexes %}
+            <tr>
+                <td class="mono">{{ idx.index_name }}</td>
+                <td class="mono">{{ idx.table_name }}</td>
+                <td>{{ idx.index_size }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+{% if report.slow_queries %}
+<div class="report-card">
+    <h3 class="section-title" style="margin-top: 0;">🐢 Slow Queries</h3>
+    <p style="color: #8b949e; font-size: 14px; margin-bottom: 15px;">
+        Queries with highest average execution time.
+    </p>
+    {% for sq in report.slow_queries[:5] %}
+    <div style="margin-bottom: 15px;">
+        <div style="display: flex; gap: 15px; margin-bottom: 5px; font-size: 13px;">
+            <span><strong>{{ sq.mean_time_ms|round|int }}ms</strong> avg</span>
+            <span style="color: #8b949e;">{{ sq.calls }} calls</span>
+            <span style="color: #8b949e;">{{ sq.rows }} rows</span>
+        </div>
+        <div class="query-text">{{ sq.query }}</div>
+    </div>
+    {% endfor %}
+</div>
+{% endif %}
+
+<div style="text-align: center; margin-top: 20px;">
+    <a href="/" style="color: #58a6ff; text-decoration: none;">← Run another check</a>
+</div>
