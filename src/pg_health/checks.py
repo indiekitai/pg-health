@@ -40,17 +40,23 @@ QUERIES = {
     
     "unused_indexes": """
         SELECT 
-            schemaname as schema_name,
-            relname as table_name,
-            indexrelname as index_name,
-            pg_size_pretty(pg_relation_size(indexrelid)) as index_size,
-            idx_scan as index_scans
-        FROM pg_stat_user_indexes
-        WHERE idx_scan = 0
-          AND indexrelname NOT LIKE '%_pkey'
-          AND indexrelname NOT LIKE '%_unique'
-        ORDER BY pg_relation_size(indexrelid) DESC
+            sui.schemaname as schema_name,
+            sui.relname as table_name,
+            sui.indexrelname as index_name,
+            pg_size_pretty(pg_relation_size(sui.indexrelid)) as index_size,
+            sui.idx_scan as index_scans
+        FROM pg_stat_user_indexes sui
+        JOIN pg_index pi ON sui.indexrelid = pi.indexrelid
+        WHERE sui.idx_scan = 0
+          AND NOT pi.indisprimary      -- exclude primary keys
+          AND NOT pi.indisunique       -- exclude unique constraints
+        ORDER BY pg_relation_size(sui.indexrelid) DESC
         LIMIT 20;
+    """,
+    
+    "stats_reset": """
+        SELECT stats_reset FROM pg_stat_database 
+        WHERE datname = current_database();
     """,
     
     "duplicate_indexes": """
@@ -261,17 +267,22 @@ async def run_health_check(connection_string: str) -> HealthReport:
         
         # Check: Unused indexes
         unused = await conn.fetch(QUERIES["unused_indexes"])
+        stats_reset = await conn.fetchval(QUERIES["stats_reset"])
+        stats_note = ""
+        if stats_reset:
+            from datetime import datetime, timezone
+            days_since_reset = (datetime.now(timezone.utc) - stats_reset).days
+            if days_since_reset < 7:
+                stats_note = f" (stats only {days_since_reset}d old - may be inaccurate)"
+            else:
+                stats_note = f" (since {stats_reset.strftime('%Y-%m-%d')})"
+        
         if unused:
-            total_size = sum(
-                int(row["index_size"].replace(" ", "").replace("kB", "000").replace("MB", "000000").replace("GB", "000000000").replace("bytes", ""))
-                for row in unused
-                if row["index_size"]
-            )
             report.checks.append(CheckResult(
                 name="Unused Indexes",
-                description="Indexes that have never been used",
+                description="Indexes that have never been scanned",
                 severity=Severity.WARNING if len(unused) > 5 else Severity.INFO,
-                message=f"{len(unused)} unused indexes found",
+                message=f"{len(unused)} unused indexes found{stats_note}",
                 suggestion="Consider dropping unused indexes to save space and improve write performance",
             ))
             for row in unused:
