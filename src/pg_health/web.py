@@ -27,7 +27,7 @@ async def check(
     request: Request,
     connection_string: Annotated[str, Form()],
 ):
-    """Run health check and return results."""
+    """Run health check and return results (HTML)."""
     
     try:
         report = await run_health_check(connection_string)
@@ -47,6 +47,27 @@ async def check(
                 "error": str(e),
             },
         )
+
+
+from pydantic import BaseModel as PydanticBaseModel
+
+class APIRequest(PydanticBaseModel):
+    connection_string: str
+
+@app.post("/api/check")
+async def api_check(req: APIRequest):
+    """Run health check and return JSON results (AI-friendly)."""
+    try:
+        report = await run_health_check(req.connection_string)
+        return {
+            "ok": True,
+            "report": report.model_dump(),
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }
 
 
 def run():
