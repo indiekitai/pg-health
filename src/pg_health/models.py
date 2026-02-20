@@ -12,6 +12,38 @@ class Severity(str, Enum):
     CRITICAL = "critical"
 
 
+class ThresholdConfig(BaseModel):
+    """Threshold configuration for a single check."""
+    warning: float
+    critical: float
+
+
+class HealthConfig(BaseModel):
+    """Configuration for health check thresholds."""
+    
+    thresholds: dict[str, ThresholdConfig] = Field(default_factory=dict)
+    
+    @classmethod
+    def defaults(cls) -> "HealthConfig":
+        """Return default thresholds."""
+        return cls(thresholds={
+            "cache_hit_ratio": ThresholdConfig(warning=0.95, critical=0.90),
+            "index_hit_ratio": ThresholdConfig(warning=0.95, critical=0.90),
+            "connections": ThresholdConfig(warning=0.70, critical=0.90),
+            "replication_lag": ThresholdConfig(warning=10, critical=60),
+            "dead_tuples": ThresholdConfig(warning=100000, critical=1000000),
+            "lock_waits": ThresholdConfig(warning=5, critical=20),
+            "table_bloat": ThresholdConfig(warning=0.10, critical=0.20),  # 10%, 20%
+        })
+    
+    def get_threshold(self, name: str) -> ThresholdConfig:
+        """Get threshold for a check, using defaults if not configured."""
+        defaults = self.defaults().thresholds
+        if name in self.thresholds:
+            return self.thresholds[name]
+        return defaults.get(name, ThresholdConfig(warning=0.8, critical=0.9))
+
+
 class CheckResult(BaseModel):
     """Result of a single health check."""
     
@@ -55,6 +87,16 @@ class SlowQuery(BaseModel):
     rows: int
 
 
+class VacuumInfo(BaseModel):
+    """Vacuum status for a table."""
+    
+    schema_name: str
+    table_name: str
+    dead_tuples: int
+    last_vacuum: datetime | None = None
+    last_autovacuum: datetime | None = None
+
+
 class HealthReport(BaseModel):
     """Complete health check report."""
     
@@ -65,6 +107,7 @@ class HealthReport(BaseModel):
     tables: list[TableInfo] = Field(default_factory=list)
     unused_indexes: list[IndexInfo] = Field(default_factory=list)
     slow_queries: list[SlowQuery] = Field(default_factory=list)
+    vacuum_stats: list[VacuumInfo] = Field(default_factory=list)
     
     @property
     def summary(self) -> dict[Severity, int]:
@@ -78,3 +121,12 @@ class HealthReport(BaseModel):
     def has_issues(self) -> bool:
         """Whether there are any warnings or critical issues."""
         return any(c.severity in (Severity.WARNING, Severity.CRITICAL) for c in self.checks)
+    
+    @property
+    def worst_severity(self) -> Severity:
+        """Return the worst severity level from all checks."""
+        if any(c.severity == Severity.CRITICAL for c in self.checks):
+            return Severity.CRITICAL
+        if any(c.severity == Severity.WARNING for c in self.checks):
+            return Severity.WARNING
+        return Severity.OK

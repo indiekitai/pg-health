@@ -1,15 +1,17 @@
 """PostgreSQL health check queries and logic."""
 
 import re
-from urllib.parse import quote, urlparse, urlunparse
+from urllib.parse import quote
 import asyncpg
 from .models import (
     CheckResult,
+    HealthConfig,
     Severity,
     TableInfo,
     IndexInfo,
     SlowQuery,
     HealthReport,
+    VacuumInfo,
 )
 
 
@@ -22,6 +24,10 @@ QUERIES = {
                pg_size_pretty(pg_database_size(pg_database.datname)) as size
         FROM pg_database
         WHERE datname = current_database();
+    """,
+    
+    "database_size_bytes": """
+        SELECT pg_database_size(current_database()) as size_bytes;
     """,
     
     "table_sizes": """
@@ -152,6 +158,29 @@ QUERIES = {
         ORDER BY seq_scan DESC
         LIMIT 10;
     """,
+    
+    # New queries for additional checks
+    "replication_lag": """
+        SELECT CASE WHEN pg_is_in_recovery() THEN 
+            EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()))::int 
+        ELSE NULL END as lag_seconds;
+    """,
+    
+    "vacuum_stats": """
+        SELECT schemaname, relname, n_dead_tup, last_vacuum, last_autovacuum
+        FROM pg_stat_user_tables 
+        WHERE n_dead_tup > 10000 
+        ORDER BY n_dead_tup DESC 
+        LIMIT 10;
+    """,
+    
+    "lock_waits": """
+        SELECT count(*) as waiting_locks FROM pg_locks WHERE NOT granted;
+    """,
+    
+    "disk_usage": """
+        SELECT pg_database_size(current_database()) as db_size_bytes;
+    """,
 }
 
 
@@ -177,8 +206,23 @@ def fix_connection_string(connection_string: str) -> str:
     return connection_string
 
 
-async def run_health_check(connection_string: str) -> HealthReport:
+def format_bytes(bytes_val: int) -> str:
+    """Format bytes into human-readable string."""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if bytes_val < 1024:
+            return f"{bytes_val:.1f} {unit}"
+        bytes_val /= 1024
+    return f"{bytes_val:.1f} PB"
+
+
+async def run_health_check(
+    connection_string: str, 
+    config: HealthConfig | None = None
+) -> HealthReport:
     """Run all health checks and return a report."""
+    
+    if config is None:
+        config = HealthConfig.defaults()
     
     # Fix special characters in password
     connection_string = fix_connection_string(connection_string)
@@ -195,44 +239,116 @@ async def run_health_check(connection_string: str) -> HealthReport:
             database_version=version.split(",")[0] if version else "Unknown",
         )
         
-        # Check: Database size
+        # Check: Database size (with human-readable format)
+        db_size_bytes = await conn.fetchval(QUERIES["database_size_bytes"])
         report.checks.append(CheckResult(
             name="Database Size",
             description="Total database size",
             severity=Severity.INFO,
             message=f"Database size: {db_info['size']}",
+            details={"size_bytes": db_size_bytes, "size_pretty": db_info['size']},
+        ))
+        
+        # Check: Replication Lag (for replicas)
+        lag_seconds = await conn.fetchval(QUERIES["replication_lag"])
+        if lag_seconds is not None:
+            threshold = config.get_threshold("replication_lag")
+            if lag_seconds > threshold.critical:
+                severity = Severity.CRITICAL
+            elif lag_seconds > threshold.warning:
+                severity = Severity.WARNING
+            else:
+                severity = Severity.OK
+            
+            report.checks.append(CheckResult(
+                name="Replication Lag",
+                description="Time behind primary (replica only)",
+                severity=severity,
+                message=f"Replication lag: {lag_seconds}s",
+                details={"lag_seconds": lag_seconds},
+                suggestion="Check network/disk I/O on replica" if severity != Severity.OK else None,
+            ))
+        else:
+            report.checks.append(CheckResult(
+                name="Replication Lag",
+                description="Time behind primary (replica only)",
+                severity=Severity.INFO,
+                message="Not a replica (primary server)",
+                details={"is_replica": False},
+            ))
+        
+        # Check: Lock Waits
+        waiting_locks = await conn.fetchval(QUERIES["lock_waits"])
+        threshold = config.get_threshold("lock_waits")
+        if waiting_locks > threshold.critical:
+            severity = Severity.CRITICAL
+        elif waiting_locks > threshold.warning:
+            severity = Severity.WARNING
+        else:
+            severity = Severity.OK
+        
+        report.checks.append(CheckResult(
+            name="Lock Waits",
+            description="Number of queries waiting for locks",
+            severity=severity,
+            message=f"{waiting_locks} waiting locks",
+            details={"waiting_locks": waiting_locks},
+            suggestion="Investigate blocking queries" if severity != Severity.OK else None,
         ))
         
         # Check: Cache hit ratio
         cache_ratio = await conn.fetchval(QUERIES["cache_hit_ratio"])
         if cache_ratio is not None:
-            ratio_pct = float(cache_ratio) * 100
-            severity = Severity.OK if ratio_pct > 95 else Severity.WARNING if ratio_pct > 80 else Severity.CRITICAL
+            threshold = config.get_threshold("cache_hit_ratio")
+            ratio = float(cache_ratio)
+            ratio_pct = ratio * 100
+            if ratio < threshold.critical:
+                severity = Severity.CRITICAL
+            elif ratio < threshold.warning:
+                severity = Severity.WARNING
+            else:
+                severity = Severity.OK
             report.checks.append(CheckResult(
                 name="Cache Hit Ratio",
                 description="Percentage of data reads from cache vs disk",
                 severity=severity,
                 message=f"Cache hit ratio: {ratio_pct:.1f}%",
+                details={"ratio": ratio},
                 suggestion="Increase shared_buffers if ratio is low" if severity != Severity.OK else None,
             ))
         
         # Check: Index hit ratio
         index_ratio = await conn.fetchval(QUERIES["index_hit_ratio"])
         if index_ratio is not None:
-            ratio_pct = float(index_ratio) * 100
-            severity = Severity.OK if ratio_pct > 95 else Severity.WARNING if ratio_pct > 80 else Severity.CRITICAL
+            threshold = config.get_threshold("index_hit_ratio")
+            ratio = float(index_ratio)
+            ratio_pct = ratio * 100
+            if ratio < threshold.critical:
+                severity = Severity.CRITICAL
+            elif ratio < threshold.warning:
+                severity = Severity.WARNING
+            else:
+                severity = Severity.OK
             report.checks.append(CheckResult(
                 name="Index Hit Ratio",
                 description="Percentage of index reads from cache",
                 severity=severity,
                 message=f"Index hit ratio: {ratio_pct:.1f}%",
+                details={"ratio": ratio},
             ))
         
         # Check: Connection usage
         conn_info = await conn.fetchrow(QUERIES["connection_count"])
         if conn_info:
-            usage_pct = (conn_info["total"] / conn_info["max_connections"]) * 100
-            severity = Severity.OK if usage_pct < 70 else Severity.WARNING if usage_pct < 90 else Severity.CRITICAL
+            threshold = config.get_threshold("connections")
+            usage_ratio = conn_info["total"] / conn_info["max_connections"]
+            usage_pct = usage_ratio * 100
+            if usage_ratio > threshold.critical:
+                severity = Severity.CRITICAL
+            elif usage_ratio > threshold.warning:
+                severity = Severity.WARNING
+            else:
+                severity = Severity.OK
             report.checks.append(CheckResult(
                 name="Connection Usage",
                 description="Current connections vs max_connections",
@@ -243,7 +359,49 @@ async def run_health_check(connection_string: str) -> HealthReport:
                     "active": conn_info["active"],
                     "idle": conn_info["idle"],
                     "max": conn_info["max_connections"],
+                    "usage_ratio": usage_ratio,
                 },
+            ))
+        
+        # Check: Vacuum Stats (dead tuples)
+        vacuum_stats = await conn.fetch(QUERIES["vacuum_stats"])
+        if vacuum_stats:
+            threshold = config.get_threshold("dead_tuples")
+            max_dead = max(row["n_dead_tup"] for row in vacuum_stats)
+            
+            if max_dead > threshold.critical:
+                severity = Severity.CRITICAL
+            elif max_dead > threshold.warning:
+                severity = Severity.WARNING
+            else:
+                severity = Severity.INFO
+            
+            tables_with_issues = len([r for r in vacuum_stats if r["n_dead_tup"] > threshold.warning])
+            
+            report.checks.append(CheckResult(
+                name="Vacuum Stats",
+                description="Tables with high dead tuple counts",
+                severity=severity,
+                message=f"{tables_with_issues} tables with > {int(threshold.warning):,} dead tuples (max: {max_dead:,})",
+                details={"tables_checked": len(vacuum_stats), "max_dead_tuples": max_dead},
+                suggestion="Run VACUUM ANALYZE on affected tables" if severity != Severity.OK else None,
+            ))
+            
+            # Store vacuum stats for report
+            for row in vacuum_stats:
+                report.vacuum_stats.append(VacuumInfo(
+                    schema_name=row["schemaname"],
+                    table_name=row["relname"],
+                    dead_tuples=row["n_dead_tup"],
+                    last_vacuum=row["last_vacuum"],
+                    last_autovacuum=row["last_autovacuum"],
+                ))
+        else:
+            report.checks.append(CheckResult(
+                name="Vacuum Stats",
+                description="Tables with high dead tuple counts",
+                severity=Severity.OK,
+                message="No tables with significant dead tuples",
             ))
         
         # Check: Long running queries
@@ -309,13 +467,23 @@ async def run_health_check(connection_string: str) -> HealthReport:
         
         # Check: Table bloat
         bloated = await conn.fetch(QUERIES["bloat_estimate"])
-        high_bloat = [b for b in bloated if b["dead_ratio"] and float(b["dead_ratio"]) > 20]
+        threshold = config.get_threshold("table_bloat")
+        high_bloat = [b for b in bloated if b["dead_ratio"] and float(b["dead_ratio"]) / 100 > threshold.warning]
+        critical_bloat = [b for b in bloated if b["dead_ratio"] and float(b["dead_ratio"]) / 100 > threshold.critical]
+        
+        if critical_bloat:
+            severity = Severity.CRITICAL
+        elif high_bloat:
+            severity = Severity.WARNING
+        else:
+            severity = Severity.OK
+            
         if high_bloat:
             report.checks.append(CheckResult(
                 name="Table Bloat",
                 description="Tables with high dead tuple ratio",
-                severity=Severity.WARNING,
-                message=f"{len(high_bloat)} tables with >20% dead tuples",
+                severity=severity,
+                message=f"{len(high_bloat)} tables with >{int(threshold.warning*100)}% dead tuples",
                 details={"tables": [dict(b) for b in high_bloat]},
                 suggestion="Run VACUUM ANALYZE on these tables",
             ))

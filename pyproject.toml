@@ -13,6 +13,7 @@ dependencies = [
     "uvicorn>=0.29",
     "jinja2>=3",
     "python-multipart>=0.0.9",
+    "pyyaml>=6",
 ]
 
 [project.optional-dependencies]

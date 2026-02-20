@@ -1,0 +1,44 @@
+# PG Health Configuration
+# Copy to config.yaml and customize thresholds
+# Use with: pg-health check --config config.yaml
+# Or set env var: PG_HEALTH_CONFIG=/path/to/config.yaml
+
+thresholds:
+  # Cache hit ratio (percentage as decimal)
+  # Lower values = more disk reads = worse performance
+  cache_hit_ratio:
+    warning: 0.95   # Warn if < 95%
+    critical: 0.90  # Critical if < 90%
+
+  # Index hit ratio (percentage as decimal)
+  index_hit_ratio:
+    warning: 0.95
+    critical: 0.90
+
+  # Connection usage (percentage of max_connections as decimal)
+  # Higher values = closer to running out of connections
+  connections:
+    warning: 0.70   # Warn if > 70% used
+    critical: 0.90  # Critical if > 90% used
+
+  # Replication lag (seconds behind primary)
+  # Only applies to replica servers
+  replication_lag:
+    warning: 10     # Warn if > 10 seconds behind
+    critical: 60    # Critical if > 60 seconds behind
+
+  # Dead tuples (absolute count per table)
+  # High dead tuples indicate vacuum is falling behind
+  dead_tuples:
+    warning: 100000   # Warn if any table has > 100k dead tuples
+    critical: 1000000 # Critical if > 1M dead tuples
+
+  # Waiting locks (count of queries waiting for locks)
+  lock_waits:
+    warning: 5      # Warn if > 5 queries waiting
+    critical: 20    # Critical if > 20 queries waiting
+
+  # Table bloat (percentage of dead tuples as decimal)
+  table_bloat:
+    warning: 0.10   # Warn if > 10% dead
+    critical: 0.20  # Critical if > 20% dead
