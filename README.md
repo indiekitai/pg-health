@@ -48,6 +48,14 @@ pg-health check -c "..." --quiet
 # With custom thresholds
 pg-health check -c "..." --config config.yaml
 
+# Get actionable recommendations
+pg-health suggest -c "..."
+
+# Apply quick fixes (with dry-run)
+pg-health fix unused-indexes -c "..." --dry-run
+pg-health fix vacuum -c "..." --tables orders,users
+pg-health fix all -c "..."
+
 # Start web interface
 pg-health serve --port 8767
 
@@ -103,6 +111,89 @@ Badge shows:
 - **Green** "DB Health | OK" - All checks passed
 - **Yellow** "DB Health | 2 warnings" - Warning-level issues
 - **Red** "DB Health | CRITICAL" - Critical issues detected
+
+### Auto-Suggest
+
+Get actionable recommendations based on your database health:
+
+```bash
+pg-health suggest -c "postgresql://user:pass@host:5432/db"
+```
+
+Output:
+```
+🔍 Analyzing database health...
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Recommendations
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔴 HIGH PRIORITY
+
+1. Increase shared_buffers
+   Why: Cache hit ratio is 89.0% (should be >95%)
+   Impact: Better cache hit ratio means faster queries
+   Action: Edit postgresql.conf, set shared_buffers to ~25% of RAM. Current: 128MB
+
+2. VACUUM ANALYZE public.orders
+   Why: 150,000 dead tuples (15.2% bloat)
+   Impact: Reclaim disk space, improve query performance
+   SQL: VACUUM ANALYZE public.orders;
+
+🟡 MEDIUM PRIORITY
+
+3. Drop unused index idx_old_column
+   Why: 0 scans since stats reset, 50MB wasted
+   Impact: Free 50MB disk space, faster writes
+   SQL: DROP INDEX public.idx_old_column;
+
+🟢 LOW PRIORITY
+
+4. Consider partitioning public.logs
+   Why: Table is 12GB with 50,000,000 rows
+   Impact: Improved query performance, easier maintenance
+   Action: Partition by date/time column if available
+```
+
+Recommendations include:
+- **Cache tuning** - shared_buffers optimization when cache hit ratio is low
+- **Unused indexes** - Indexes that waste space and slow writes
+- **Vacuum suggestions** - Tables with high dead tuple counts
+- **Missing indexes** - Tables with heavy sequential scans
+- **Partitioning hints** - Large tables that could benefit from partitioning
+- **Statistics updates** - Tables with outdated statistics
+- **Slow query analysis** - Via pg_stat_statements
+
+### Quick Fix
+
+Apply fixes automatically or preview with `--dry-run`:
+
+```bash
+# Preview what would be dropped
+pg-health fix unused-indexes -c "..." --dry-run
+
+# Actually drop unused indexes
+pg-health fix unused-indexes -c "..."
+
+# Vacuum specific tables
+pg-health fix vacuum -c "..." --tables orders,users
+
+# Run all safe fixes
+pg-health fix all -c "..." --dry-run
+```
+
+**Safe fixes** (can auto-execute):
+| Fix Type | What it does |
+|----------|--------------|
+| `unused-indexes` | DROP INDEX for indexes with 0 scans |
+| `vacuum` | VACUUM ANALYZE tables with high dead tuples |
+| `analyze` | ANALYZE tables with outdated statistics |
+| `all` | Run all of the above |
+
+**Unsafe operations** (suggest only shows SQL, never executes):
+- CREATE INDEX (may lock table)
+- Config changes (requires restart)
+- Schema changes
 
 ## Configuration
 
@@ -224,6 +315,8 @@ Your connection string is never stored. All checks run in real-time and results 
 - [x] Configurable thresholds
 - [x] JSON output mode
 - [x] Status badges
+- [x] Auto-suggest recommendations
+- [x] Quick fix commands
 - [ ] Email alerts for critical issues
 - [ ] Scheduled checks (cron)
 - [ ] Historical trends

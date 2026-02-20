@@ -15,6 +15,15 @@ from rich.panel import Panel
 
 from .checks import run_health_check
 from .models import Severity, HealthConfig, ThresholdConfig
+from .suggest import generate_suggestions, Priority, Recommendation
+from .fix import (
+    fix_unused_indexes,
+    fix_vacuum,
+    fix_analyze,
+    fix_all,
+    FixType,
+    FixResult,
+)
 
 load_dotenv()
 
@@ -341,6 +350,259 @@ def serve(
     console.print(f"[bold]Starting PG Health web interface...[/bold]")
     console.print(f"Open http://localhost:{port} in your browser")
     uvicorn.run(web_app, host=host, port=port)
+
+
+PRIORITY_COLORS = {
+    Priority.HIGH: "red",
+    Priority.MEDIUM: "yellow",
+    Priority.LOW: "green",
+}
+
+PRIORITY_ICONS = {
+    Priority.HIGH: "🔴",
+    Priority.MEDIUM: "🟡",
+    Priority.LOW: "🟢",
+}
+
+
+@app.command()
+def suggest(
+    connection: Annotated[
+        str | None,
+        typer.Option("--connection", "-c", help="PostgreSQL connection string"),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", "-j", help="Output results as JSON"),
+    ] = False,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help="Path to YAML config file"),
+    ] = None,
+):
+    """Analyze database and provide actionable recommendations.
+    
+    Examines your database for potential issues and suggests specific
+    fixes with SQL commands you can run.
+    """
+    
+    conn_str = connection or os.getenv("DATABASE_URL")
+    if not conn_str:
+        if json_output:
+            print(json.dumps({"ok": False, "error": "No connection string provided"}))
+        else:
+            console.print("[red]Error: No connection string provided.[/red]")
+            console.print("Use --connection or set DATABASE_URL in .env")
+        raise typer.Exit(2)
+    
+    # Load config
+    health_config = load_config(config)
+    
+    if not json_output:
+        console.print("[bold]🔍 Analyzing database health...[/bold]\n")
+    
+    try:
+        recommendations = asyncio.run(generate_suggestions(conn_str, health_config))
+    except Exception as e:
+        if json_output:
+            print(json.dumps({"ok": False, "error": str(e)}))
+        else:
+            console.print(f"[red]Connection failed: {e}[/red]")
+        raise typer.Exit(2)
+    
+    # JSON output mode
+    if json_output:
+        result = {
+            "ok": True,
+            "recommendations": [
+                {
+                    "priority": r.priority.value,
+                    "title": r.title,
+                    "why": r.why,
+                    "impact": r.impact,
+                    "sql": r.sql,
+                    "action": r.action,
+                    "fix_type": r.fix_type,
+                    "details": r.details,
+                }
+                for r in recommendations
+            ],
+        }
+        print(json.dumps(result, indent=2, default=str))
+        raise typer.Exit(0)
+    
+    if not recommendations:
+        console.print("[bold green]✨ No recommendations - your database looks healthy![/bold green]")
+        raise typer.Exit(0)
+    
+    # Group by priority
+    console.print("━" * 60)
+    console.print("[bold]Recommendations[/bold]")
+    console.print("━" * 60 + "\n")
+    
+    current_priority = None
+    counter = 0
+    
+    for rec in recommendations:
+        # Print priority header if changed
+        if rec.priority != current_priority:
+            current_priority = rec.priority
+            color = PRIORITY_COLORS[rec.priority]
+            icon = PRIORITY_ICONS[rec.priority]
+            console.print(f"\n{icon} [bold {color}]{rec.priority.value.upper()} PRIORITY[/bold {color}]\n")
+        
+        counter += 1
+        console.print(f"[bold]{counter}. {rec.title}[/bold]")
+        console.print(f"   [dim]Why:[/dim] {rec.why}")
+        
+        if rec.impact:
+            console.print(f"   [dim]Impact:[/dim] {rec.impact}")
+        
+        if rec.sql:
+            console.print(f"   [dim]SQL:[/dim] [cyan]{rec.sql}[/cyan]")
+        elif rec.action:
+            console.print(f"   [dim]Action:[/dim] {rec.action}")
+        
+        console.print()
+    
+    # Show fix command hints
+    console.print("━" * 60)
+    console.print("\n[bold]Quick Fix Commands:[/bold]")
+    console.print("  pg-health fix unused-indexes -c \"...\" --dry-run")
+    console.print("  pg-health fix vacuum -c \"...\" --dry-run")
+    console.print("  pg-health fix all -c \"...\" --dry-run")
+    console.print("\n[dim]Add --dry-run to preview changes before executing.[/dim]")
+
+
+@app.command()
+def fix(
+    issue: Annotated[
+        str,
+        typer.Argument(help="Issue to fix: unused-indexes, vacuum, analyze, all"),
+    ],
+    connection: Annotated[
+        str | None,
+        typer.Option("--connection", "-c", help="PostgreSQL connection string"),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", "-n", help="Preview changes without executing"),
+    ] = False,
+    tables: Annotated[
+        str | None,
+        typer.Option("--tables", "-t", help="Comma-separated list of tables (for vacuum/analyze)"),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", "-j", help="Output results as JSON"),
+    ] = False,
+):
+    """Apply quick fixes to common database issues.
+    
+    Safe fixes (can auto-execute):
+    - unused-indexes: DROP unused indexes
+    - vacuum: VACUUM ANALYZE tables with high dead tuples
+    - analyze: Update table statistics
+    - all: Run all safe fixes
+    
+    Use --dry-run to preview what would be executed.
+    """
+    
+    # Validate issue type
+    try:
+        fix_type = FixType(issue)
+    except ValueError:
+        valid = ", ".join(ft.value for ft in FixType)
+        if json_output:
+            print(json.dumps({"ok": False, "error": f"Invalid issue type. Valid: {valid}"}))
+        else:
+            console.print(f"[red]Invalid issue type: {issue}[/red]")
+            console.print(f"Valid options: {valid}")
+        raise typer.Exit(1)
+    
+    conn_str = connection or os.getenv("DATABASE_URL")
+    if not conn_str:
+        if json_output:
+            print(json.dumps({"ok": False, "error": "No connection string provided"}))
+        else:
+            console.print("[red]Error: No connection string provided.[/red]")
+            console.print("Use --connection or set DATABASE_URL in .env")
+        raise typer.Exit(2)
+    
+    # Parse tables list
+    table_list = None
+    if tables:
+        table_list = [t.strip() for t in tables.split(",")]
+    
+    if not json_output:
+        mode = "[yellow]DRY RUN[/yellow]" if dry_run else "[red]EXECUTING[/red]"
+        console.print(f"[bold]🔧 Fix: {issue}[/bold] ({mode})\n")
+    
+    try:
+        if fix_type == FixType.UNUSED_INDEXES:
+            results = asyncio.run(fix_unused_indexes(conn_str, dry_run))
+        elif fix_type == FixType.VACUUM:
+            results = asyncio.run(fix_vacuum(conn_str, dry_run, table_list))
+        elif fix_type == FixType.ANALYZE:
+            results = asyncio.run(fix_analyze(conn_str, dry_run, table_list))
+        elif fix_type == FixType.ALL:
+            results = asyncio.run(fix_all(conn_str, dry_run))
+        else:
+            results = []
+    except Exception as e:
+        if json_output:
+            print(json.dumps({"ok": False, "error": str(e)}))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(2)
+    
+    # JSON output
+    if json_output:
+        result = {
+            "ok": all(r.success for r in results),
+            "dry_run": dry_run,
+            "results": [
+                {
+                    "fix_type": r.fix_type,
+                    "sql": r.sql,
+                    "executed": r.executed,
+                    "success": r.success,
+                    "message": r.message,
+                    "details": r.details,
+                }
+                for r in results
+            ],
+        }
+        print(json.dumps(result, indent=2, default=str))
+        raise typer.Exit(0 if result["ok"] else 1)
+    
+    if not results:
+        console.print("[bold green]✨ Nothing to fix![/bold green]")
+        raise typer.Exit(0)
+    
+    # Display results
+    for r in results:
+        if r.success:
+            icon = "📋" if not r.executed else "✅"
+            console.print(f"{icon} {r.message}")
+            console.print(f"   [dim]{r.sql}[/dim]")
+        else:
+            console.print(f"❌ {r.message}")
+        console.print()
+    
+    # Summary
+    total = len(results)
+    executed = sum(1 for r in results if r.executed)
+    success = sum(1 for r in results if r.success)
+    
+    console.print("━" * 60)
+    if dry_run:
+        console.print(f"[bold]Summary:[/bold] {total} operations would be executed")
+        console.print("\n[yellow]Run without --dry-run to apply these changes.[/yellow]")
+    else:
+        console.print(f"[bold]Summary:[/bold] {success}/{executed} operations successful")
+    
+    raise typer.Exit(0 if all(r.success for r in results) else 1)
 
 
 if __name__ == "__main__":
