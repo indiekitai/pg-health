@@ -380,6 +380,33 @@ All thresholds are configurable via the YAML config file.
 - PostgreSQL 12+ (for pg_stat_statements)
 - PyYAML (for custom thresholds)
 
+## Cloud Database Support
+
+### Supabase
+
+```bash
+# Get connection string from Supabase Dashboard > Settings > Database
+pg-health check -c "postgresql://postgres.[project-ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres"
+
+# Or use direct connection (port 5432)
+pg-health check -c "postgresql://postgres:[password]@db.[project-ref].supabase.co:5432/postgres"
+```
+
+### Neon
+
+```bash
+# Get connection string from Neon Console
+pg-health check -c "postgresql://[user]:[password]@[endpoint].neon.tech/[database]?sslmode=require"
+```
+
+### AWS RDS / Aurora
+
+```bash
+pg-health check -c "postgresql://[user]:[password]@[instance].rds.amazonaws.com:5432/[database]"
+```
+
+**Note:** Some checks (like pg_stat_statements) may require enabling extensions or specific permissions on managed databases.
+
 ## Privacy
 
 Your connection string is never stored. All checks run in real-time and results are not saved on our servers.
@@ -494,8 +521,8 @@ Available metrics include:
 - [x] Webhook notifications
 - [x] Email alerts (SMTP)
 - [x] Historical trends (SQLite)
+- [x] Supabase/Neon support (via connection string)
 - [ ] Scheduled checks (built-in daemon)
-- [ ] Supabase/Neon integration
 
 ## License
 
