@@ -605,5 +605,94 @@ def fix(
     raise typer.Exit(0 if all(r.success for r in results) else 1)
 
 
+@app.command()
+def notify(
+    connection: Annotated[
+        str | None,
+        typer.Option("--connection", "-c", help="PostgreSQL connection string"),
+    ] = None,
+    provider: Annotated[
+        str,
+        typer.Option("--provider", "-p", help="Notification provider: telegram, slack, webhook"),
+    ] = "telegram",
+    only_issues: Annotated[
+        bool,
+        typer.Option("--only-issues/--always", help="Only notify if there are issues"),
+    ] = True,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help="Path to YAML config file"),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Output as JSON"),
+    ] = False,
+):
+    """
+    Run health check and send notification.
+    
+    Supports: telegram, slack, webhook
+    
+    Environment variables:
+      - PG_HEALTH_TELEGRAM_TOKEN: Telegram bot token
+      - PG_HEALTH_TELEGRAM_CHAT_ID: Telegram chat ID
+      - PG_HEALTH_SLACK_WEBHOOK: Slack incoming webhook URL
+      - PG_HEALTH_WEBHOOK_URL: Generic webhook URL
+    """
+    from .notify import send_telegram, send_slack, send_webhook, NotifyResult
+    
+    conn_str = connection or os.getenv("DATABASE_URL")
+    if not conn_str:
+        if json_output:
+            print(json.dumps({"ok": False, "error": "No connection string provided"}))
+        else:
+            console.print("[red]Error: No connection string provided.[/red]")
+        raise typer.Exit(2)
+    
+    # Run health check
+    health_config = load_config(config)
+    try:
+        report = asyncio.run(run_health_check(conn_str, health_config))
+    except Exception as e:
+        if json_output:
+            print(json.dumps({"ok": False, "error": str(e)}))
+        else:
+            console.print(f"[red]Error running health check: {e}[/red]")
+        raise typer.Exit(2)
+    
+    # Send notification
+    providers = {
+        "telegram": send_telegram,
+        "slack": send_slack,
+        "webhook": send_webhook,
+    }
+    
+    if provider not in providers:
+        if json_output:
+            print(json.dumps({"ok": False, "error": f"Unknown provider: {provider}"}))
+        else:
+            console.print(f"[red]Unknown provider: {provider}[/red]")
+            console.print(f"Valid: {', '.join(providers.keys())}")
+        raise typer.Exit(1)
+    
+    result = providers[provider](report, only_on_issues=only_issues)
+    
+    if json_output:
+        print(json.dumps({
+            "ok": result.success,
+            "provider": result.provider,
+            "message": result.message,
+            "error": result.error,
+            "health_status": report.worst_severity.value,
+        }))
+    else:
+        if result.success:
+            console.print(f"[green]✅ {result.provider}: {result.message}[/green]")
+        else:
+            console.print(f"[red]❌ {result.provider}: {result.error}[/red]")
+    
+    raise typer.Exit(0 if result.success else 1)
+
+
 if __name__ == "__main__":
     app()

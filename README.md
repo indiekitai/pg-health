@@ -19,6 +19,11 @@ PostgreSQL health check and optimization tool. Get instant insights into your da
 - ⏳ **Transaction ID Age** - Tables approaching wraparound
 - 🛡️ **Security Checks** - Public schema permissions audit
 - 💾 **Tablespace Usage** - Tablespace sizes and locations
+- 🔀 **Replication Slots** - Slot status and WAL retention
+- 📝 **Background Writer** - Checkpoint statistics
+- 📊 **WAL Statistics** - WAL file count and settings
+- ⚙️ **Configuration Audit** - Settings vs best practices
+- 📱 **Notifications** - Telegram, Slack, Webhook alerts
 
 ## Quick Start
 
@@ -379,6 +384,59 @@ All thresholds are configurable via the YAML config file.
 
 Your connection string is never stored. All checks run in real-time and results are not saved on our servers.
 
+## Notifications
+
+Get alerts when health checks find issues.
+
+### Telegram
+
+```bash
+# Set credentials
+export PG_HEALTH_TELEGRAM_TOKEN="your-bot-token"
+export PG_HEALTH_TELEGRAM_CHAT_ID="your-chat-id"
+
+# Run check and notify
+pg-health notify -c "postgresql://..." --provider telegram
+
+# Only notify if there are issues (default)
+pg-health notify -c "..." --only-issues
+
+# Always notify (even if healthy)
+pg-health notify -c "..." --always
+```
+
+### Slack
+
+```bash
+export PG_HEALTH_SLACK_WEBHOOK="https://hooks.slack.com/services/..."
+pg-health notify -c "..." --provider slack
+```
+
+### Webhook (generic)
+
+```bash
+export PG_HEALTH_WEBHOOK_URL="https://your-server.com/webhook"
+pg-health notify -c "..." --provider webhook
+```
+
+Webhook payload:
+```json
+{
+  "database": "mydb",
+  "status": "warning",
+  "has_issues": true,
+  "checks": [...],
+  "summary": {"total_checks": 20, "warnings": 2, "criticals": 0}
+}
+```
+
+### Cron Example
+
+```bash
+# Run every hour, only alert on issues
+0 * * * * pg-health notify -c "$DATABASE_URL" --only-issues
+```
+
 ## Roadmap
 
 - [x] Replication lag monitoring
@@ -389,8 +447,11 @@ Your connection string is never stored. All checks run in real-time and results 
 - [x] Status badges
 - [x] Auto-suggest recommendations
 - [x] Quick fix commands
+- [x] Telegram notifications
+- [x] Slack notifications
+- [x] Webhook notifications
 - [ ] Email alerts for critical issues
-- [ ] Scheduled checks (cron)
+- [ ] Scheduled checks (cron daemon)
 - [ ] Historical trends
 - [ ] Supabase/Neon integration
 

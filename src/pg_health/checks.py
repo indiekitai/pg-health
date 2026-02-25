@@ -233,6 +233,78 @@ QUERIES = {
         FROM pg_tablespace;
     """,
     
+    "replication_slots": """
+        SELECT 
+            slot_name,
+            slot_type,
+            database,
+            active,
+            pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) as retained_wal,
+            pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) as retained_bytes
+        FROM pg_replication_slots
+        WHERE NOT temporary;
+    """,
+    
+    "bgwriter_stats": """
+        SELECT 
+            checkpoints_timed,
+            checkpoints_req,
+            checkpoint_write_time,
+            checkpoint_sync_time,
+            buffers_checkpoint,
+            buffers_clean,
+            maxwritten_clean,
+            buffers_backend,
+            buffers_backend_fsync,
+            buffers_alloc,
+            stats_reset
+        FROM pg_stat_bgwriter;
+    """,
+    
+    "wal_stats": """
+        SELECT 
+            (SELECT count(*) FROM pg_ls_waldir()) as wal_files,
+            (SELECT setting FROM pg_settings WHERE name = 'wal_level') as wal_level,
+            (SELECT setting FROM pg_settings WHERE name = 'archive_mode') as archive_mode,
+            (SELECT setting FROM pg_settings WHERE name = 'max_wal_size') as max_wal_size
+        WHERE NOT pg_is_in_recovery();
+    """,
+    
+    "config_audit": """
+        SELECT 
+            name,
+            setting,
+            unit,
+            context,
+            CASE 
+                WHEN name = 'shared_buffers' AND setting::bigint * 
+                    CASE WHEN unit = '8kB' THEN 8192 WHEN unit = 'kB' THEN 1024 ELSE 1 END < 268435456 
+                THEN 'Consider increasing shared_buffers (currently ' || 
+                    pg_size_pretty(setting::bigint * CASE WHEN unit = '8kB' THEN 8192 WHEN unit = 'kB' THEN 1024 ELSE 1 END) || 
+                    ', recommend 25% of RAM, min 256MB)'
+                WHEN name = 'work_mem' AND setting::bigint < 4096 
+                THEN 'Consider increasing work_mem (currently ' || setting || 'kB, recommend 4-64MB for complex queries)'
+                WHEN name = 'maintenance_work_mem' AND setting::bigint < 65536 
+                THEN 'Consider increasing maintenance_work_mem for faster VACUUM/CREATE INDEX'
+                WHEN name = 'effective_cache_size' AND setting::bigint * 8192 < 536870912 
+                THEN 'Consider increasing effective_cache_size (recommend 50-75% of RAM)'
+                WHEN name = 'random_page_cost' AND setting::numeric > 1.5 AND EXISTS (SELECT 1 FROM pg_settings WHERE name = 'data_directory')
+                THEN 'Consider lowering random_page_cost to 1.1-1.5 for SSD storage'
+                WHEN name = 'checkpoint_completion_target' AND setting::numeric < 0.9 
+                THEN 'Consider setting checkpoint_completion_target to 0.9'
+                WHEN name = 'wal_buffers' AND setting::bigint < 2048 
+                THEN 'Consider increasing wal_buffers (recommend 64MB for write-heavy workloads)'
+                ELSE NULL
+            END as recommendation
+        FROM pg_settings 
+        WHERE name IN (
+            'shared_buffers', 'work_mem', 'maintenance_work_mem', 'effective_cache_size',
+            'max_connections', 'checkpoint_completion_target', 'random_page_cost',
+            'wal_buffers', 'max_wal_size', 'min_wal_size', 'wal_level'
+        )
+        ORDER BY name;
+    """,
+    
     "config_recommendations": """
         SELECT 
             name,
@@ -780,6 +852,118 @@ async def run_health_check(
                     severity=Severity.INFO,
                     message=f"{len(tablespaces)} tablespace(s)",
                     details={"tablespaces": [dict(t) for t in tablespaces]},
+                ))
+        except Exception:
+            pass
+        
+        # NEW: Replication slots
+        try:
+            slots = await conn.fetch(QUERIES["replication_slots"])
+            if slots:
+                inactive_slots = [s for s in slots if not s['active']]
+                # Check for slots retaining too much WAL (> 1GB)
+                large_retention = [s for s in slots if s['retained_bytes'] and s['retained_bytes'] > 1073741824]
+                
+                if large_retention:
+                    severity = Severity.WARNING
+                    msg = f"{len(slots)} slot(s), {len(large_retention)} retaining >1GB WAL"
+                elif inactive_slots:
+                    severity = Severity.INFO
+                    msg = f"{len(slots)} slot(s), {len(inactive_slots)} inactive"
+                else:
+                    severity = Severity.OK
+                    msg = f"{len(slots)} replication slot(s), all healthy"
+                
+                report.checks.append(CheckResult(
+                    name="Replication Slots",
+                    description="Replication slot status and WAL retention",
+                    severity=severity,
+                    message=msg,
+                    details={"slots": [dict(s) for s in slots]},
+                    suggestion="Drop unused slots to free WAL space" if large_retention or inactive_slots else None,
+                ))
+            else:
+                report.checks.append(CheckResult(
+                    name="Replication Slots",
+                    description="Replication slot status",
+                    severity=Severity.INFO,
+                    message="No replication slots configured",
+                ))
+        except Exception:
+            pass
+        
+        # NEW: BG Writer stats
+        try:
+            bgw = await conn.fetchrow(QUERIES["bgwriter_stats"])
+            if bgw:
+                total_checkpoints = (bgw['checkpoints_timed'] or 0) + (bgw['checkpoints_req'] or 0)
+                requested_pct = (bgw['checkpoints_req'] / total_checkpoints * 100) if total_checkpoints > 0 else 0
+                
+                # High requested checkpoint ratio indicates checkpoint_timeout too high or max_wal_size too low
+                if requested_pct > 50 and total_checkpoints > 10:
+                    severity = Severity.WARNING
+                    suggestion = "High requested checkpoint ratio - consider increasing max_wal_size"
+                else:
+                    severity = Severity.OK
+                    suggestion = None
+                
+                report.checks.append(CheckResult(
+                    name="Background Writer",
+                    description="Checkpoint and buffer write statistics",
+                    severity=severity,
+                    message=f"{total_checkpoints} checkpoints ({requested_pct:.0f}% requested)",
+                    details={
+                        "checkpoints_timed": bgw['checkpoints_timed'],
+                        "checkpoints_requested": bgw['checkpoints_req'],
+                        "buffers_checkpoint": bgw['buffers_checkpoint'],
+                        "buffers_backend": bgw['buffers_backend'],
+                        "buffers_backend_fsync": bgw['buffers_backend_fsync'],
+                    },
+                    suggestion=suggestion,
+                ))
+        except Exception:
+            pass
+        
+        # NEW: WAL stats (primary only)
+        try:
+            wal = await conn.fetchrow(QUERIES["wal_stats"])
+            if wal and wal['wal_files']:
+                report.checks.append(CheckResult(
+                    name="WAL Statistics",
+                    description="Write-ahead log file count and settings",
+                    severity=Severity.INFO,
+                    message=f"{wal['wal_files']} WAL files, level={wal['wal_level']}, archive={wal['archive_mode']}",
+                    details={
+                        "wal_files": wal['wal_files'],
+                        "wal_level": wal['wal_level'],
+                        "archive_mode": wal['archive_mode'],
+                        "max_wal_size": wal['max_wal_size'],
+                    },
+                ))
+        except Exception:
+            pass
+        
+        # NEW: Configuration audit
+        try:
+            configs = await conn.fetch(QUERIES["config_audit"])
+            recommendations = [c for c in configs if c['recommendation']]
+            
+            if recommendations:
+                report.checks.append(CheckResult(
+                    name="Configuration Audit",
+                    description="PostgreSQL configuration vs best practices",
+                    severity=Severity.INFO if len(recommendations) <= 2 else Severity.WARNING,
+                    message=f"{len(recommendations)} configuration suggestion(s)",
+                    details={"configs": [dict(c) for c in configs], "recommendations": [dict(r) for r in recommendations]},
+                    suggestion=recommendations[0]['recommendation'] if recommendations else None,
+                ))
+            else:
+                report.checks.append(CheckResult(
+                    name="Configuration Audit",
+                    description="PostgreSQL configuration vs best practices",
+                    severity=Severity.OK,
+                    message="Configuration looks good",
+                    details={"configs": [dict(c) for c in configs]},
                 ))
         except Exception:
             pass
