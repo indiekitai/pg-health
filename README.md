@@ -14,6 +14,11 @@ PostgreSQL health check and optimization tool. Get instant insights into your da
 - 🔄 **Replication Lag** - Time behind primary (replicas)
 - 🔒 **Lock Waits** - Queries waiting for locks
 - 🧹 **Vacuum Stats** - Tables needing vacuum attention
+- 🔀 **Duplicate Indexes** - Redundant indexes wasting space
+- 🔗 **FK Missing Indexes** - Foreign keys without indexes (slow JOINs)
+- ⏳ **Transaction ID Age** - Tables approaching wraparound
+- 🛡️ **Security Checks** - Public schema permissions audit
+- 💾 **Tablespace Usage** - Tablespace sizes and locations
 
 ## Quick Start
 
@@ -358,6 +363,9 @@ Note: Special characters in password (like `@`) are auto-encoded.
 | Lock Waits | ≤ 5 | 6-20 | > 20 |
 | Dead Tuples | < 100k | 100k-1M | > 1M |
 | Table Bloat | < 10% dead | 10-20% dead | > 20% dead |
+| Duplicate Indexes | 0 | 1+ pairs | - |
+| FK Missing Indexes | 0-3 | 4+ | - |
+| Transaction ID Age | < 500M | 500M-1B | > 1B |
 
 All thresholds are configurable via the YAML config file.
 
