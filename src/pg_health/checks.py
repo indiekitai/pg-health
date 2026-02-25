@@ -181,6 +181,116 @@ QUERIES = {
     "disk_usage": """
         SELECT pg_database_size(current_database()) as db_size_bytes;
     """,
+    
+    # New checks - added based on competitor analysis
+    "duplicate_indexes_v2": """
+        SELECT 
+            pg_size_pretty(sum(pg_relation_size(idx))::bigint) as total_size,
+            (array_agg(idx::text))[1] as index1,
+            (array_agg(idx::text))[2] as index2,
+            tbl::text as table_name
+        FROM (
+            SELECT indexrelid::regclass as idx, 
+                   indrelid::regclass as tbl,
+                   indkey as cols
+            FROM pg_index
+            WHERE indisunique = false
+        ) sub
+        GROUP BY tbl, cols
+        HAVING count(*) > 1;
+    """,
+    
+    "fk_missing_indexes": """
+        SELECT 
+            c.conname as constraint_name,
+            c.conrelid::regclass as table_name,
+            a.attname as column_name,
+            c.confrelid::regclass as referenced_table
+        FROM pg_constraint c
+        JOIN pg_attribute a ON a.attnum = ANY(c.conkey) AND a.attrelid = c.conrelid
+        WHERE c.contype = 'f'
+          AND NOT EXISTS (
+              SELECT 1 FROM pg_index i 
+              WHERE i.indrelid = c.conrelid 
+                AND a.attnum = ANY(i.indkey)
+          );
+    """,
+    
+    "wal_stats": """
+        SELECT 
+            (SELECT count(*) FROM pg_ls_waldir()) as wal_files,
+            (SELECT setting FROM pg_settings WHERE name = 'wal_level') as wal_level,
+            (SELECT setting FROM pg_settings WHERE name = 'archive_mode') as archive_mode,
+            pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')) as wal_total_size
+        WHERE pg_is_in_recovery() = false;
+    """,
+    
+    "tablespace_usage": """
+        SELECT 
+            spcname as name,
+            pg_size_pretty(pg_tablespace_size(oid)) as size,
+            pg_tablespace_location(oid) as location
+        FROM pg_tablespace;
+    """,
+    
+    "config_recommendations": """
+        SELECT 
+            name,
+            setting,
+            unit,
+            boot_val,
+            source,
+            CASE 
+                WHEN name = 'shared_buffers' THEN 
+                    CASE WHEN setting::bigint * 8192 < 134217728 THEN 'Consider increasing (currently ' || pg_size_pretty(setting::bigint * 8192) || ', recommend 25% of RAM)'
+                    ELSE 'OK' END
+                WHEN name = 'work_mem' THEN
+                    CASE WHEN setting::bigint < 4096 THEN 'Consider increasing (currently ' || setting || 'kB, recommend 4-64MB)'
+                    ELSE 'OK' END
+                WHEN name = 'maintenance_work_mem' THEN
+                    CASE WHEN setting::bigint < 65536 THEN 'Consider increasing for faster VACUUM/CREATE INDEX'
+                    ELSE 'OK' END
+                WHEN name = 'effective_cache_size' THEN
+                    CASE WHEN setting::bigint * 8192 < 536870912 THEN 'Consider increasing (recommend 50-75% of RAM)'
+                    ELSE 'OK' END
+                ELSE 'OK'
+            END as recommendation
+        FROM pg_settings 
+        WHERE name IN ('shared_buffers', 'work_mem', 'maintenance_work_mem', 'effective_cache_size', 
+                       'max_connections', 'checkpoint_completion_target', 'random_page_cost');
+    """,
+    
+    "security_checks": """
+        SELECT 
+            'public_schema_permissions' as check_name,
+            CASE 
+                WHEN has_schema_privilege('public', 'public', 'CREATE') 
+                THEN 'WARNING: public role can create objects in public schema'
+                ELSE 'OK'
+            END as status
+        UNION ALL
+        SELECT 
+            'superuser_count',
+            'INFO: ' || count(*) || ' superuser roles' 
+        FROM pg_roles WHERE rolsuper = true;
+    """,
+    
+    "table_age": """
+        SELECT 
+            t.schemaname || '.' || t.relname as table_name,
+            age(c.relfrozenxid) as xid_age,
+            CASE 
+                WHEN age(c.relfrozenxid) > 1000000000 THEN 'CRITICAL: approaching wraparound'
+                WHEN age(c.relfrozenxid) > 500000000 THEN 'WARNING: needs vacuum freeze soon'
+                ELSE 'OK'
+            END as status
+        FROM pg_stat_user_tables t
+        JOIN pg_class c ON c.relname = t.relname 
+          AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = t.schemaname)
+        WHERE age(c.relfrozenxid) > 100000000
+        ORDER BY age(c.relfrozenxid) DESC
+        LIMIT 10;
+    """,
 }
 
 
@@ -556,6 +666,123 @@ async def run_health_check(
                 message="pg_stat_statements extension not enabled",
                 suggestion="Enable pg_stat_statements for query performance insights",
             ))
+        
+        # NEW: Check for duplicate indexes
+        try:
+            duplicates = await conn.fetch(QUERIES["duplicate_indexes_v2"])
+            if duplicates:
+                total_wasted = sum(1 for d in duplicates)  # count pairs
+                report.checks.append(CheckResult(
+                    name="Duplicate Indexes",
+                    description="Indexes with identical columns on same table",
+                    severity=Severity.WARNING,
+                    message=f"{total_wasted} duplicate index pair(s) found",
+                    details={"duplicates": [dict(d) for d in duplicates]},
+                    suggestion="Review and drop redundant indexes to save space",
+                ))
+            else:
+                report.checks.append(CheckResult(
+                    name="Duplicate Indexes",
+                    description="Indexes with identical columns on same table",
+                    severity=Severity.OK,
+                    message="No duplicate indexes found",
+                ))
+        except Exception:
+            pass
+        
+        # NEW: Check for foreign keys missing indexes
+        try:
+            fk_no_idx = await conn.fetch(QUERIES["fk_missing_indexes"])
+            if fk_no_idx:
+                report.checks.append(CheckResult(
+                    name="FK Missing Indexes",
+                    description="Foreign key columns without indexes",
+                    severity=Severity.WARNING if len(fk_no_idx) > 3 else Severity.INFO,
+                    message=f"{len(fk_no_idx)} foreign keys without indexes",
+                    details={"missing": [dict(f) for f in fk_no_idx]},
+                    suggestion="Add indexes on FK columns for faster JOINs and CASCADE deletes",
+                ))
+            else:
+                report.checks.append(CheckResult(
+                    name="FK Missing Indexes",
+                    description="Foreign key columns without indexes",
+                    severity=Severity.OK,
+                    message="All foreign keys have indexes",
+                ))
+        except Exception:
+            pass
+        
+        # NEW: Check for table age (transaction ID wraparound)
+        try:
+            aged_tables = await conn.fetch(QUERIES["table_age"])
+            critical_age = [t for t in aged_tables if 'CRITICAL' in t['status']]
+            warning_age = [t for t in aged_tables if 'WARNING' in t['status']]
+            
+            if critical_age:
+                severity = Severity.CRITICAL
+            elif warning_age:
+                severity = Severity.WARNING
+            else:
+                severity = Severity.OK
+            
+            if aged_tables:
+                max_age = max(t['xid_age'] for t in aged_tables)
+                report.checks.append(CheckResult(
+                    name="Transaction ID Age",
+                    description="Table age approaching wraparound threshold",
+                    severity=severity,
+                    message=f"Max XID age: {max_age:,} ({len(critical_age)} critical, {len(warning_age)} warning)",
+                    details={"tables": [dict(t) for t in aged_tables[:5]]},
+                    suggestion="Run VACUUM FREEZE on old tables" if severity != Severity.OK else None,
+                ))
+            else:
+                report.checks.append(CheckResult(
+                    name="Transaction ID Age",
+                    description="Table age approaching wraparound threshold",
+                    severity=Severity.OK,
+                    message="All tables have healthy XID age",
+                ))
+        except Exception:
+            pass
+        
+        # NEW: Security checks
+        try:
+            security = await conn.fetch(QUERIES["security_checks"])
+            warnings = [s for s in security if 'WARNING' in s['status']]
+            
+            if warnings:
+                report.checks.append(CheckResult(
+                    name="Security Checks",
+                    description="Basic security configuration audit",
+                    severity=Severity.WARNING,
+                    message=f"{len(warnings)} security warning(s)",
+                    details={"checks": [dict(s) for s in security]},
+                    suggestion="Review and fix security warnings",
+                ))
+            else:
+                report.checks.append(CheckResult(
+                    name="Security Checks",
+                    description="Basic security configuration audit",
+                    severity=Severity.OK,
+                    message="No security issues detected",
+                    details={"checks": [dict(s) for s in security]},
+                ))
+        except Exception:
+            pass
+        
+        # NEW: Tablespace usage
+        try:
+            tablespaces = await conn.fetch(QUERIES["tablespace_usage"])
+            if tablespaces:
+                report.checks.append(CheckResult(
+                    name="Tablespace Usage",
+                    description="Tablespace sizes and locations",
+                    severity=Severity.INFO,
+                    message=f"{len(tablespaces)} tablespace(s)",
+                    details={"tablespaces": [dict(t) for t in tablespaces]},
+                ))
+        except Exception:
+            pass
         
         return report
         
