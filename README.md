@@ -95,6 +95,70 @@ case $? in
 esac
 ```
 
+## MCP Server (for AI Agents)
+
+pg-health includes an MCP server for integration with Claude, Cursor, and other AI tools.
+
+### Setup
+
+```bash
+pip install fastmcp
+```
+
+### Add to Claude Desktop
+
+Add to `~/.config/claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "pg-health": {
+      "command": "pg-health-mcp"
+    }
+  }
+}
+```
+
+### Available Tools
+
+| Tool | Description |
+|------|-------------|
+| `pg_health_check` | Run comprehensive health check, returns status + issues |
+| `pg_health_suggest` | Get prioritized optimization recommendations |
+| `pg_health_fix` | Apply fixes (dry-run by default for safety) |
+
+### Example Usage
+
+Claude or other agents can:
+
+```
+> Check my database health
+[uses pg_health_check with your connection string]
+
+> What should I optimize?
+[uses pg_health_suggest, returns prioritized recommendations]
+
+> Drop the unused indexes (dry run first)
+[uses pg_health_fix with fix_type="unused-indexes", dry_run=True]
+```
+
+### Direct Python Usage
+
+```python
+from pg_health.mcp_server import pg_health_check, pg_health_suggest, pg_health_fix
+
+# Get health report as JSON
+result = pg_health_check("postgresql://user:pass@host:5432/db")
+
+# Get recommendations
+suggestions = pg_health_suggest("postgresql://...")
+
+# Preview fixes (dry run)
+fixes = pg_health_fix("postgresql://...", fix_type="unused-indexes", dry_run=True)
+```
+
+---
+
 ### Status Badge
 
 Generate an SVG badge for dashboards or READMEs:

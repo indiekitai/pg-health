@@ -18,9 +18,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
+mcp = ["fastmcp>=0.1.0"]
 
 [project.scripts]
 pg-health = "pg_health.cli:app"
+pg-health-mcp = "pg_health.mcp_server:main"
 
 [tool.ruff]
 line-length = 100
