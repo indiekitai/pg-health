@@ -205,6 +205,109 @@ def send_webhook(
         )
 
 
+def send_email(
+    report: HealthReport,
+    smtp_host: Optional[str] = None,
+    smtp_port: Optional[int] = None,
+    smtp_user: Optional[str] = None,
+    smtp_pass: Optional[str] = None,
+    from_addr: Optional[str] = None,
+    to_addr: Optional[str] = None,
+    only_on_issues: bool = True,
+) -> NotifyResult:
+    """
+    Send health report via email (SMTP).
+    
+    Environment variables:
+      - PG_HEALTH_SMTP_HOST
+      - PG_HEALTH_SMTP_PORT (default: 587)
+      - PG_HEALTH_SMTP_USER
+      - PG_HEALTH_SMTP_PASS
+      - PG_HEALTH_EMAIL_FROM
+      - PG_HEALTH_EMAIL_TO
+    """
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    
+    host = smtp_host or os.getenv("PG_HEALTH_SMTP_HOST")
+    port = smtp_port or int(os.getenv("PG_HEALTH_SMTP_PORT", "587"))
+    user = smtp_user or os.getenv("PG_HEALTH_SMTP_USER")
+    password = smtp_pass or os.getenv("PG_HEALTH_SMTP_PASS")
+    sender = from_addr or os.getenv("PG_HEALTH_EMAIL_FROM")
+    recipient = to_addr or os.getenv("PG_HEALTH_EMAIL_TO")
+    
+    if not all([host, user, password, sender, recipient]):
+        return NotifyResult(
+            success=False,
+            provider="email",
+            error="Missing SMTP configuration (host/user/pass/from/to)",
+        )
+    
+    if only_on_issues and not report.has_issues:
+        return NotifyResult(
+            success=True,
+            provider="email",
+            message="Skipped - no issues to report",
+        )
+    
+    # Build email
+    status = report.worst_severity.value.upper()
+    subject = f"[pg-health] {report.database_name}: {status}"
+    
+    text_body = format_report_text(report, include_ok=True)
+    
+    # HTML body
+    html_parts = [f"<h2>🐘 PG Health Report: {report.database_name}</h2>"]
+    html_parts.append(f"<p><strong>Status:</strong> {SEVERITY_EMOJI.get(report.worst_severity, '❓')} {status}</p>")
+    
+    criticals = [c for c in report.checks if c.severity == Severity.CRITICAL]
+    warnings = [c for c in report.checks if c.severity == Severity.WARNING]
+    oks = [c for c in report.checks if c.severity == Severity.OK]
+    
+    if criticals:
+        html_parts.append("<h3>❌ Critical Issues</h3><ul>")
+        for c in criticals:
+            html_parts.append(f"<li><strong>{c.name}:</strong> {c.message}</li>")
+        html_parts.append("</ul>")
+    
+    if warnings:
+        html_parts.append("<h3>⚠️ Warnings</h3><ul>")
+        for c in warnings:
+            html_parts.append(f"<li><strong>{c.name}:</strong> {c.message}</li>")
+        html_parts.append("</ul>")
+    
+    html_parts.append(f"<p>✅ {len(oks)} checks passed</p>")
+    html_parts.append("<hr><p><small>Sent by pg-health</small></p>")
+    
+    html_body = "\n".join(html_parts)
+    
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = recipient
+    msg.attach(MIMEText(text_body, "plain"))
+    msg.attach(MIMEText(html_body, "html"))
+    
+    try:
+        with smtplib.SMTP(host, port) as server:
+            server.starttls()
+            server.login(user, password)
+            server.sendmail(sender, [recipient], msg.as_string())
+        
+        return NotifyResult(
+            success=True,
+            provider="email",
+            message=f"Sent to {recipient}",
+        )
+    except Exception as e:
+        return NotifyResult(
+            success=False,
+            provider="email",
+            error=str(e),
+        )
+
+
 def send_slack(
     report: HealthReport,
     webhook_url: Optional[str] = None,

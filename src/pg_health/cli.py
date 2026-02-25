@@ -113,10 +113,16 @@ def check(
         Path | None,
         typer.Option("--config", help="Path to YAML config file for thresholds"),
     ] = None,
+    save: Annotated[
+        bool,
+        typer.Option("--save", help="Save results to history database for trending"),
+    ] = False,
 ):
     """Run health checks on a PostgreSQL database.
     
     Exit codes: 0=OK, 1=WARNING, 2=CRITICAL
+    
+    Use --save to record results for historical trending.
     """
     
     conn_str = connection or os.getenv("DATABASE_URL")
@@ -150,6 +156,15 @@ def check(
     # Determine exit code based on worst severity
     worst = report.worst_severity
     exit_code = EXIT_CODES.get(worst, 0)
+    
+    # Save to history if requested
+    if save:
+        from .history import save_report
+        import hashlib
+        conn_hash = hashlib.md5(conn_str.encode()).hexdigest()[:8]
+        save_report(report, conn_hash)
+        if not quiet and not json_output:
+            console.print("[dim]📊 Saved to history[/dim]\n")
     
     # Quiet mode - just output status
     if quiet:
@@ -639,7 +654,7 @@ def notify(
       - PG_HEALTH_SLACK_WEBHOOK: Slack incoming webhook URL
       - PG_HEALTH_WEBHOOK_URL: Generic webhook URL
     """
-    from .notify import send_telegram, send_slack, send_webhook, NotifyResult
+    from .notify import send_telegram, send_slack, send_webhook, send_email, NotifyResult
     
     conn_str = connection or os.getenv("DATABASE_URL")
     if not conn_str:
@@ -665,6 +680,7 @@ def notify(
         "telegram": send_telegram,
         "slack": send_slack,
         "webhook": send_webhook,
+        "email": send_email,
     }
     
     if provider not in providers:
@@ -692,6 +708,159 @@ def notify(
             console.print(f"[red]❌ {result.provider}: {result.error}[/red]")
     
     raise typer.Exit(0 if result.success else 1)
+
+
+@app.command()
+def history(
+    database: Annotated[
+        str | None,
+        typer.Option("--database", "-d", help="Filter by database name"),
+    ] = None,
+    days: Annotated[
+        int,
+        typer.Option("--days", help="Look back this many days"),
+    ] = 7,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-n", help="Maximum entries to show"),
+    ] = 20,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Output as JSON"),
+    ] = False,
+):
+    """
+    View health check history.
+    
+    Requires running checks with --save to populate history.
+    """
+    from .history import get_history, get_databases
+    
+    entries = get_history(database, days, limit)
+    
+    if json_output:
+        data = [
+            {
+                "id": e.id,
+                "database": e.database_name,
+                "checked_at": e.checked_at.isoformat(),
+                "status": e.worst_severity,
+                "warnings": e.warnings,
+                "criticals": e.criticals,
+            }
+            for e in entries
+        ]
+        print(json.dumps(data, indent=2))
+        raise typer.Exit(0)
+    
+    if not entries:
+        console.print("[yellow]No history found.[/yellow]")
+        console.print("Run health checks with --save to record history.")
+        raise typer.Exit(0)
+    
+    # Display table
+    table = Table(title=f"Health Check History (last {days} days)")
+    table.add_column("Time", style="dim")
+    table.add_column("Database")
+    table.add_column("Status")
+    table.add_column("Warnings", justify="right")
+    table.add_column("Critical", justify="right")
+    
+    for e in entries:
+        status_color = {
+            "ok": "green",
+            "info": "blue", 
+            "warning": "yellow",
+            "critical": "red",
+        }.get(e.worst_severity, "white")
+        
+        table.add_row(
+            e.checked_at.strftime("%Y-%m-%d %H:%M"),
+            e.database_name,
+            f"[{status_color}]{e.worst_severity.upper()}[/{status_color}]",
+            str(e.warnings),
+            str(e.criticals) if e.criticals else "-",
+        )
+    
+    console.print(table)
+    
+    # Show available databases
+    dbs = get_databases()
+    if len(dbs) > 1:
+        console.print(f"\n[dim]Databases with history: {', '.join(dbs)}[/dim]")
+
+
+@app.command()
+def trend(
+    database: Annotated[
+        str,
+        typer.Argument(help="Database name"),
+    ],
+    metric: Annotated[
+        str | None,
+        typer.Option("--metric", "-m", help="Metric name (e.g., 'Cache Hit Ratio.ratio')"),
+    ] = None,
+    days: Annotated[
+        int,
+        typer.Option("--days", help="Look back this many days"),
+    ] = 7,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Output as JSON"),
+    ] = False,
+):
+    """
+    View metric trends over time.
+    
+    Use --metric to specify which metric to show.
+    Without --metric, lists available metrics.
+    """
+    from .history import get_metric_trend, get_available_metrics
+    
+    if not metric:
+        # List available metrics
+        metrics = get_available_metrics(database)
+        if json_output:
+            print(json.dumps({"database": database, "metrics": metrics}))
+        else:
+            console.print(f"[bold]Available metrics for {database}:[/bold]")
+            for m in metrics:
+                console.print(f"  • {m}")
+            if not metrics:
+                console.print("[yellow]No metrics found. Run checks with --save first.[/yellow]")
+        raise typer.Exit(0)
+    
+    points = get_metric_trend(database, metric, days)
+    
+    if json_output:
+        data = [
+            {"timestamp": p.timestamp.isoformat(), "value": p.value}
+            for p in points
+        ]
+        print(json.dumps({"database": database, "metric": metric, "points": data}, indent=2))
+        raise typer.Exit(0)
+    
+    if not points:
+        console.print(f"[yellow]No data for metric '{metric}'[/yellow]")
+        raise typer.Exit(0)
+    
+    console.print(f"[bold]{metric}[/bold] (last {days} days)\n")
+    
+    # Simple ASCII chart
+    values = [p.value for p in points]
+    min_val, max_val = min(values), max(values)
+    
+    if min_val == max_val:
+        console.print(f"Constant value: {min_val}")
+    else:
+        # Normalize to 0-20 range for display
+        chart_height = 10
+        for i, p in enumerate(points[-20:]):  # Last 20 points
+            normalized = int((p.value - min_val) / (max_val - min_val) * chart_height)
+            bar = "█" * normalized + "░" * (chart_height - normalized)
+            console.print(f"{p.timestamp.strftime('%m-%d %H:%M')} {bar} {p.value:.2f}")
+    
+    console.print(f"\n[dim]Min: {min_val:.2f}, Max: {max_val:.2f}, Latest: {values[-1]:.2f}[/dim]")
 
 
 if __name__ == "__main__":

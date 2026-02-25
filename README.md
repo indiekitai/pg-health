@@ -437,6 +437,48 @@ Webhook payload:
 0 * * * * pg-health notify -c "$DATABASE_URL" --only-issues
 ```
 
+### Email
+
+```bash
+export PG_HEALTH_SMTP_HOST="smtp.gmail.com"
+export PG_HEALTH_SMTP_PORT="587"
+export PG_HEALTH_SMTP_USER="your@gmail.com"
+export PG_HEALTH_SMTP_PASS="app-password"
+export PG_HEALTH_EMAIL_FROM="your@gmail.com"
+export PG_HEALTH_EMAIL_TO="alerts@yourcompany.com"
+
+pg-health notify -c "..." --provider email
+```
+
+## Historical Trends
+
+Track health metrics over time with built-in SQLite storage.
+
+```bash
+# Run check and save to history
+pg-health check -c "..." --save
+
+# View history
+pg-health history
+pg-health history --database mydb --days 30
+
+# List available metrics
+pg-health trend mydb
+
+# View specific metric trend
+pg-health trend mydb --metric "Cache Hit Ratio.ratio"
+pg-health trend mydb --metric "Connection Usage.usage_ratio" --days 30
+```
+
+Data is stored in `~/.pg-health/history.db` (configurable via `PG_HEALTH_DATA_DIR`).
+
+Available metrics include:
+- Cache/Index hit ratios
+- Connection counts
+- Lock waits
+- Background writer stats
+- Database size
+
 ## Roadmap
 
 - [x] Replication lag monitoring
@@ -450,9 +492,9 @@ Webhook payload:
 - [x] Telegram notifications
 - [x] Slack notifications
 - [x] Webhook notifications
-- [ ] Email alerts for critical issues
-- [ ] Scheduled checks (cron daemon)
-- [ ] Historical trends
+- [x] Email alerts (SMTP)
+- [x] Historical trends (SQLite)
+- [ ] Scheduled checks (built-in daemon)
 - [ ] Supabase/Neon integration
 
 ## License
